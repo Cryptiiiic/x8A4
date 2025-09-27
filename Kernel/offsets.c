@@ -61,6 +61,13 @@ int offsets_init(void) {
     x8A4_log_error("Failed calloc kernel_offsets, impossible!\n", "");
     return -1;
   }
+  koffsets_cached->macos = 0;
+  const char *DTPlatformName = strstr(gXPF.kernelInfoPlist, "<key>DTPlatformName</key>");
+  char osName[100];
+  sscanf(DTPlatformName, "<key>DTPlatformName</key>\t<string>%9[^<]</string>", osName);
+  if(strcmp(osName, "macosx") == 0) {
+    koffsets_cached->macos = 1;
+  }
   koffsets_cached->proc_pid = 0x10;
   koffsets_cached->proc_task = 0x18;
   koffsets_cached->proc_list_next = 0x0;
@@ -97,10 +104,18 @@ int offsets_init(void) {
     koffsets_cached->io_dt_nvram = 0xB8;
   }
   if (ios_1430b) {
-    koffsets_cached->io_dt_nvram = 0xC0;
+    if(koffsets_cached->macos) {
+      koffsets_cached->io_dt_nvram = 0xE0;
+    } else {
+      koffsets_cached->io_dt_nvram = 0xC0;
+    }
   }
   if (ios_1430b_) {
-    koffsets_cached->io_dt_nvram = 0xC8;
+    if(koffsets_cached->macos) {
+      koffsets_cached->io_dt_nvram = 0xE8;
+    } else {
+      koffsets_cached->io_dt_nvram = 0xC8;
+    }
   }
   if (ios_1500) {
     koffsets_cached->proc_pid = 0x68;
@@ -110,12 +125,20 @@ int offsets_init(void) {
   }
   if (ios_1540) {
     koffsets_cached->ipc_port_kobject = 0x48;
-    koffsets_cached->io_dt_nvram = 0xB8;
+    if(koffsets_cached->macos) {
+      koffsets_cached->io_dt_nvram = 0xC0;
+    } else {
+      koffsets_cached->io_dt_nvram = 0xB8;
+    }
   }
   if (ios_1600) {
     koffsets_cached->proc_pid = 0x60;
     koffsets_cached->smr = 0x3;
-    koffsets_cached->io_dt_nvram = 0xC0;
+    if(koffsets_cached->macos) {
+      koffsets_cached->io_dt_nvram = 0xC8;
+    } else {
+      koffsets_cached->io_dt_nvram = 0xC0;
+    }
   }
   if (ios_1610) {
     koffsets_cached->table_smr = 0x1;

@@ -27,6 +27,7 @@ enum apple_mobile_apnonce_external_selectors {
 
 /* Structure Variables */
 struct kernel_offsets {
+  uint64_t macos;
   uint64_t proc_pid;
   uint64_t proc_task;
   uint64_t proc_list_next;

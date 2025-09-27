@@ -79,6 +79,94 @@ int xpf_init(void) {
 // int xpf_init(void) { return
 // xpf_start_with_kernel_path(get_kernel_path_legacy()); }
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/storage/IOBlockStorageDriver.h>
+#include <IOKit/storage/IOMedia.h>
+#include <IOKit/IOBSD.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mount.h>
+
+// Function to get mount point for a BSD device name
+char* getMountPoint(const char* bsdName) {
+  if (!bsdName) return NULL;
+
+  // Use getmntinfo to get all mounted filesystems
+  struct statfs *mounts;
+  int numMounts = getmntinfo(&mounts, MNT_NOWAIT);
+
+  if (numMounts == 0) return NULL;
+
+  char devicePath[256];
+  snprintf(devicePath, sizeof(devicePath), "/dev/%s", bsdName);
+
+  for (int i = 0; i < numMounts; i++) {
+    if (strcmp(mounts[i].f_mntfromname, devicePath) == 0) {
+      // Found the mount, return a copy of the mount point
+      return strdup(mounts[i].f_mntonname);
+    }
+  }
+
+  return NULL;
+}
+char* getStringProperty(io_object_t obj, CFStringRef key) {
+  CFTypeRef prop = IORegistryEntryCreateCFProperty(obj, key, kCFAllocatorDefault, 0);
+  if (!prop) return NULL;
+
+  char* result = NULL;
+  if (CFGetTypeID(prop) == CFStringGetTypeID()) {
+    CFIndex length = CFStringGetLength((CFStringRef)prop);
+    CFIndex maxSize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
+    result = malloc(maxSize);
+    if (result) {
+      CFStringGetCString((CFStringRef)prop, result, maxSize, kCFStringEncodingUTF8);
+    }
+  }
+
+  CFRelease(prop);
+  return result;
+}
+
+const char *get_boot_uuid(void) {
+  io_iterator_t iterator;
+  io_object_t obj;
+
+  CFMutableDictionaryRef volumeMatching = IOServiceMatching("AppleAPFSVolume");
+  if (!volumeMatching) {
+    printf("Failed to create volume matching dictionary\n");
+    return NULL;
+  }
+
+  kern_return_t kr = IOServiceGetMatchingServices(kIOMasterPortDefault, volumeMatching, &iterator);
+  if (kr != KERN_SUCCESS) {
+    printf("Failed to get APFS volumes: %d\n", kr);
+    return NULL;
+  }
+  char* volumeUUID = NULL;
+  while ((obj = IOIteratorNext(iterator)) != 0) {
+    char* volumeName = getStringProperty(obj, CFSTR("BSD Name"));
+    volumeUUID = getStringProperty(obj, CFSTR("UUID"));
+
+    char* mountPoint = getMountPoint(volumeName);
+    if(mountPoint && strncmp(mountPoint, "/System/Volumes/Data", strlen(mountPoint)) == 0) {
+      if (volumeName) free(volumeName);
+      if (mountPoint) free(mountPoint);
+      break;
+    }
+
+    if (volumeName) free(volumeName);
+    if (volumeUUID) free(volumeUUID);
+    if (mountPoint) free(mountPoint);
+
+    IOObjectRelease(obj);
+  }
+
+  IOObjectRelease(iterator);
+  return volumeUUID;
+}
+
 /**
  * @brief           Get the path to the filesystem kernel inside preboot
  * @return          Kernel path
@@ -87,7 +175,7 @@ const char *get_kernel_path(void) {
   if (kernel_path_cached) {
     return kernel_path_cached;
   }
-  const char *preboot_path = "/private/preboot/";
+  const char *preboot_path = "/System/Volumes/Preboot/";
   if (access(preboot_path, F_OK) != 0) {
     x8A4_log_error("Can't proceed with kernel init, %s not found!\n", preboot_path);
     return NULL;
@@ -118,11 +206,12 @@ const char *get_kernel_path(void) {
     j+=2;
   }
   boot_manifest_hash_str[end] = '\0';
+  const char *uuid = get_boot_uuid();
 
-  const char *format = "/private/preboot/%s/System/Library/Caches/"
+  const char *format = "/System/Volumes/Preboot/%s/boot/%s/System/Library/Caches/"
                        "com.apple.kernelcaches/kernelcache";
-  char *kernel_path = (char *)calloc(1, 256);
-  snprintf(kernel_path, 256, format, boot_manifest_hash_str);
+  char *kernel_path = (char *)calloc(1, 1024);
+  snprintf(kernel_path, 1024, format, uuid ? uuid : "", boot_manifest_hash_str);
   kernel_path_cached = kernel_path;
   return (const char *)kernel_path;
 }
@@ -354,6 +443,7 @@ uint64_t get_ipc_port(mach_port_name_t port_name) {
       table + (MACH_PORT_INDEX(port_name) * koffsets_cached->ipc_entry_size) +
           koffsets_cached->ipc_entry_object,
       &port, 8);
+  unsign_ptr(&port);
   if (ret || !port) {
     x8A4_log_error("Failed to read port from kernel ipc_entry object! (%d:0x%016llX)\\n", ret, port);
     return 0;
