@@ -25,11 +25,100 @@
 struct nvram_key *nvram_keys_cached;
 int nvram_keys_count_cached = -1;
 
+/* Bounds used when locating the nvram variables dictionary inside the
+ * IODTNVRAM service object, see get_service_nvram_dict(). The dictionary moved
+ * between releases, so rather than a fixed offset we scan the object and, one
+ * level deeper, the IODTNVRAMVariables member that holds it on iOS 16+. */
+#define NVRAM_SCAN_MIN 0x10
+#define NVRAM_SCAN_MAX 0x600
+#define NVRAM_SUBSCAN_MIN 0x10
+#define NVRAM_SUBSCAN_MAX 0x80
+#define NVRAM_DICT_MAX_ENTRIES 0x1000
+#define NVRAM_SCORE_KEYS 64
+#define NVRAM_KEY_BUF 128
+
 /* Functions */
 /**
- * @brief           Gets a service's nvram dict from it's kobject
- * @param[in]       service
- * @return          Address of the nvram dict
+ * @brief           Heuristic check for a plausible kernel heap pointer
+ * @param[in]       ptr
+ * @return          Non-zero if ptr looks like an 8-byte-aligned kernel pointer
+ */
+static inline int is_kernel_pointer(uint64_t ptr) {
+  return ptr && (ptr & 7) == 0 && (ptr >> 40) != 0;
+}
+
+/**
+ * @brief           Score a candidate OSDictionary as the nvram variables dict
+ *
+ * The IODTNVRAM variables dictionary is the only dictionary reachable from the
+ * options service whose keys carry an NVRAM GUID prefix (e.g.
+ * "7C436110-AB2A-4BBB-A880-FE41995C9F82:boot-args"), which lets us identify it
+ * without depending on a fixed struct offset. System-GUID matches are weighted
+ * above common-GUID matches so the system variables dict wins when both exist.
+ *
+ * @param[in]       dict
+ * @return          sys_guid_count * 1000 + common_guid_count (0 if not a dict)
+ */
+static int score_nvram_dict(uint64_t dict) {
+  uint64_t entries = 0;
+  if (kread(dict + koffsets_cached->os_dict, &entries, 8) || !entries) {
+    return 0;
+  }
+  unsign_ptr(&entries);
+  uint64_t size = 0;
+  if (kread(dict + koffsets_cached->os_dict_size, &size, 8)) {
+    return 0;
+  }
+  uint32_t count = (uint32_t)size;
+  if (count == 0 || count > NVRAM_DICT_MAX_ENTRIES) {
+    return 0;
+  }
+  if (count > NVRAM_SCORE_KEYS) {
+    count = NVRAM_SCORE_KEYS;
+  }
+  const size_t sys_guid_len = strlen(kAppleSystemVarGUID);
+  const size_t common_guid_len = strlen(kAppleNVRAMGUID);
+  int sys_guid = 0;
+  int common_guid = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    struct os_dict_entry entry = {0};
+    if (kread(entries + i * sizeof(entry), &entry, sizeof(entry)) ||
+        !entry.key) {
+      continue;
+    }
+    uint32_t key_len = get_os_metabase_size(entry.key);
+    extract_os_size(&key_len);
+    if (key_len == 0 || key_len >= NVRAM_KEY_BUF) {
+      continue;
+    }
+    uint64_t key_str = os_object_cast(entry.key, OS_STRING);
+    if (!key_str) {
+      continue;
+    }
+    char key[NVRAM_KEY_BUF] = {0};
+    if (kread(key_str, key, key_len)) {
+      continue;
+    }
+    if (strncmp(key, kAppleSystemVarGUID, sys_guid_len) == 0) {
+      sys_guid++;
+    } else if (strncmp(key, kAppleNVRAMGUID, common_guid_len) == 0) {
+      common_guid++;
+    }
+  }
+  return sys_guid * 1000 + common_guid;
+}
+
+/**
+ * @brief           Get the nvram variables dictionary for a service
+ *
+ * On iOS 16+ the IODTNVRAM struct layout changed: the variables dictionary is
+ * no longer at a fixed offset but held inside an IODTNVRAMVariables member.
+ * This function scans the kobject (and one level deep) for the OSDictionary
+ * whose keys carry an NVRAM GUID prefix, which is the only dictionary in the
+ * object graph with that property.
+ *
+ * @param[in]       service  The IODeviceTree:/options service
+ * @return          Kernel address of the variables OSDictionary, or 0
  */
 uint64_t get_service_nvram_dict(io_service_t service) {
   uint64_t kobject = get_ipc_kobject(service);
@@ -37,13 +126,38 @@ uint64_t get_service_nvram_dict(io_service_t service) {
     x8A4_log_error("Kobject is NULL!\n", "");
     return 0;
   }
-  uint64_t nvram_dict = 0;
-  int ret = kread(kobject + koffsets_cached->io_dt_nvram, &nvram_dict, 8);
-  if (ret || !nvram_dict) {
-    x8A4_log_error("Failed to read kernel nvram dict from kobject! (%d: 0x%016llX)\n", ret, nvram_dict);
+  x8A4_log_debug("Locating nvram dict from kobject 0x%016llX\n", kobject);
+  uint64_t best_dict = 0;
+  int best_score = 0;
+  for (uint32_t off = NVRAM_SCAN_MIN; off <= NVRAM_SCAN_MAX; off += 8) {
+    uint64_t cand = 0;
+    if (kread(kobject + off, &cand, 8) || !is_kernel_pointer(cand)) {
+      continue;
+    }
+    int score = score_nvram_dict(cand);
+    if (score > best_score) {
+      best_score = score;
+      best_dict = cand;
+    }
+    for (uint32_t soff = NVRAM_SUBSCAN_MIN; soff <= NVRAM_SUBSCAN_MAX; soff += 8) {
+      uint64_t sub = 0;
+      if (kread(cand + soff, &sub, 8) || !is_kernel_pointer(sub)) {
+        continue;
+      }
+      int subscore = score_nvram_dict(sub);
+      if (subscore > best_score) {
+        best_score = subscore;
+        best_dict = sub;
+      }
+    }
+  }
+  if (!best_dict) {
+    x8A4_log_error("Failed to find nvram dict by scanning kobject!\n", "");
     return 0;
   }
-  return nvram_dict;
+  x8A4_log_debug("Found nvram dict 0x%016llX (guid-score=%d)\n",
+                 best_dict, best_score);
+  return best_dict;
 }
 
 /**

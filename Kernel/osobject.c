@@ -153,6 +153,9 @@ uint64_t get_entry_from_os_dict(uint64_t dict, enum os_type entry_type,
       continue;
     }
     char key_string[PATH_MAX];
+    if (key_len >= sizeof(key_string)) {
+      continue;
+    }
     ret = kread(key, key_string, key_len);
     if (ret || key_string[0] == '\0') {
       continue;
